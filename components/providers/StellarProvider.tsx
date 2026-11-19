@@ -19,13 +19,16 @@ import {
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { Api as RpcApi, assembleTransaction, Server as SorobanServer } from '@stellar/stellar-sdk/rpc';
 import { useWalletStore, NETWORK_PASSPHRASES, StellarNetwork } from '@/stores/walletStore';
+import { useEnvironmentStore } from '@/stores/environment';
 import { WalletErrorOverlay } from './WalletErrorOverlay';
 import { createLogger } from '@/lib/logger';
 import { startPerformanceMark, endPerformanceMark } from '@/lib/monitoring';
+import { categorizeSigningError } from '@/lib/wallet/signingErrors';
+import { useSigningFailuresStore, type RecoverableSigningCategory } from '@/stores/signingFailures';
 
-// ─── Network Configuration ────────────────────────────────────────────────────
+const log = createLogger('StellarProvider');
 
-const NETWORK_CONFIG: Record<
+const FALLBACK_NETWORK_CONFIG: Record<
     StellarNetwork,
     { horizonUrl: string; sorobanRpcUrl: string }
 > = {
@@ -43,12 +46,6 @@ const NETWORK_CONFIG: Record<
     },
 };
 
-const EXPECTED_NETWORK: StellarNetwork = 'TESTNET';
-
-const log = createLogger('StellarProvider');
-
-// ─── Context Types ────────────────────────────────────────────────────────────
-
 interface InvokeContractParams {
     contractId: string;
     method: string;
@@ -63,13 +60,11 @@ interface StellarContextValue {
     horizonUrl: string;
     sorobanRpcUrl: string;
     isFreighterInstalled: boolean;
+    expectedNetwork: StellarNetwork;
+    isWrongNetwork: boolean;
 }
 
-// ─── Context ─────────────────────────────────────────────────────────────────
-
 const StellarContext = createContext<StellarContextValue | null>(null);
-
-// ─── Provider ─────────────────────────────────────────────────────────────────
 
 export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
     children,
@@ -86,24 +81,56 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
         reset,
     } = useWalletStore();
 
+    const {
+        getActiveProfileConfig,
+        setConnectionStatus,
+    } = useEnvironmentStore();
+
     const [isFreighterInstalled, setIsFreighterInstalled] = useState(false);
     const [overlayState, setOverlayState] = useState<{
         show: boolean;
-        type: 'no-wallet' | 'wrong-network' | 'generic';
+        type:
+            | 'no-wallet'
+            | 'wrong-network'
+            | 'generic'
+            | 'signing-rejected'
+            | 'session-expired'
+            | 'malformed-tx';
         currentNetwork?: string;
         message?: string;
     }>({ show: false, type: 'generic' });
+    const [signRetry, setSignRetry] = useState<null | (() => Promise<string | null>)>(null);
+    const [expectedNetwork, setExpectedNetwork] = useState<StellarNetwork>('TESTNET');
+    const [networkConfig, setNetworkConfig] = useState({ horizonUrl: '', sorobanRpcUrl: '' });
 
     const initializingRef = useRef(false);
 
-    const networkConfig = NETWORK_CONFIG[network] ?? NETWORK_CONFIG['TESTNET'];
+    const isWrongNetwork = network !== expectedNetwork;
 
-    // ── Helpers ─────────────────────────────────────────────────────────────
+    useEffect(() => {
+        const profile = getActiveProfileConfig();
+        setExpectedNetwork(profile.stellarNetwork);
+        setNetworkConfig({
+            horizonUrl: profile.horizonUrl,
+            sorobanRpcUrl: profile.sorobanRpcUrl,
+        });
+    }, [getActiveProfileConfig]);
 
     const showOverlay = useCallback(
         (
-            type: 'no-wallet' | 'wrong-network' | 'generic',
-            extra?: { currentNetwork?: string; message?: string }
+            type:
+                | 'no-wallet'
+                | 'wrong-network'
+                | 'generic'
+                | 'signing-rejected'
+                | 'session-expired'
+                | 'malformed-tx',
+            extra?: {
+                currentNetwork?: string;
+                message?: string;
+                retry?: (xdr: string) => Promise<string | null>;
+                pendingXdr?: string;
+            }
         ) => {
             setOverlayState({ show: true, type, ...extra });
         },
@@ -125,15 +152,17 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
 
             setNetwork(freighterNetwork, passphrase);
 
-            if (freighterNetwork !== EXPECTED_NETWORK) {
+            if (freighterNetwork !== expectedNetwork) {
                 showOverlay('wrong-network', {
                     currentNetwork: freighterNetwork,
                 });
+            } else {
+                dismissOverlay();
             }
         } catch {
             // Non-fatal — proceed silently
         }
-    }, [setNetwork, showOverlay]);
+    }, [setNetwork, showOverlay, dismissOverlay, expectedNetwork]);
 
     useEffect(() => {
         const initialize = async () => {
@@ -179,7 +208,7 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
         };
 
         initialize();
-    }, []);
+    }, [setConnected, setLoading, setPublicKey, syncNetworkFromFreighter]);
 
     useEffect(() => {
         if (!isFreighterInstalled) return;
@@ -199,7 +228,7 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
                     const newNetwork = netObj.network as StellarNetwork;
                     if (newNetwork !== network) {
                         setNetwork(newNetwork, netObj.networkPassphrase);
-                        if (newNetwork !== EXPECTED_NETWORK) {
+                        if (newNetwork !== expectedNetwork) {
                             showOverlay('wrong-network', { currentNetwork: newNetwork });
                         } else {
                             dismissOverlay();
@@ -217,6 +246,7 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
         isFreighterInstalled,
         publicKey,
         network,
+        expectedNetwork,
         setPublicKey,
         setConnected,
         setNetwork,
@@ -224,7 +254,23 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
         dismissOverlay,
     ]);
 
-    // ── connect() ────────────────────────────────────────────────────────────
+    const checkRpcConnection = useCallback(async () => {
+        try {
+            const response = await fetch(`${networkConfig.sorobanRpcUrl}/health`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(5000),
+            }).catch(() => null);
+            setConnectionStatus(response?.ok ? 'connected' : 'disconnected');
+        } catch {
+            setConnectionStatus('disconnected');
+        }
+    }, [networkConfig.sorobanRpcUrl, setConnectionStatus]);
+
+    useEffect(() => {
+        checkRpcConnection();
+        const interval = setInterval(checkRpcConnection, 30000);
+        return () => clearInterval(interval);
+    }, [checkRpcConnection]);
 
     const connect = useCallback(async () => {
         const connectionResult = await isConnected();
@@ -279,6 +325,47 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
                 setError('Wallet not connected. Please connect first.');
                 return null;
             }
+            if (isWrongNetwork) {
+                showOverlay('wrong-network', { currentNetwork: network });
+                return null;
+            }
+
+            const retry = async () => signTxRef.current(xdr);
+            const routeOverlay = (
+                category: ReturnType<typeof categorizeSigningError>['category'],
+                rawMessage: string
+            ) => {
+                log.warn('Wallet signing failed', {
+                    category,
+                    label: rawMessage,
+                });
+                setError(rawMessage);
+                if (category !== 'wrong-network') {
+                    useSigningFailuresStore.getState().recordFailure({
+                        category: category as RecoverableSigningCategory,
+                        message: rawMessage,
+                    });
+                }
+                switch (category) {
+                    case 'rejected':
+                        setSignRetry(() => retry);
+                        showOverlay('signing-rejected', { message: rawMessage });
+                        break;
+                    case 'expired-session':
+                        setSignRetry(() => retry);
+                        showOverlay('session-expired', { message: rawMessage });
+                        break;
+                    case 'malformed-transaction':
+                        setSignRetry(() => retry);
+                        showOverlay('malformed-tx', { message: rawMessage });
+                        break;
+                    case 'wrong-network':
+                        showOverlay('wrong-network', { currentNetwork: network });
+                        break;
+                    default:
+                        showOverlay('generic', { message: rawMessage });
+                }
+            };
 
             try {
                 setLoading(true);
@@ -288,28 +375,41 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
                 });
 
                 if (result.error) {
-                    setError(result.error.message ?? 'Transaction signing failed.');
+                    const failure = categorizeSigningError(result.error.message);
+                    routeOverlay(
+                        failure.category,
+                        result.error.message ?? 'Transaction signing failed.'
+                    );
                     return null;
                 }
 
                 return result.signedTxXdr;
             } catch (err: unknown) {
-                const message = err instanceof Error ? err.message : 'Signing failed.';
-                setError(message);
+                const failure = categorizeSigningError(err);
+                const rawMessage =
+                    err instanceof Error ? err.message : 'Signing failed.';
+                routeOverlay(failure.category, rawMessage);
                 return null;
             } finally {
                 setLoading(false);
             }
         },
-        [storeConnected, publicKey, network, showOverlay, setLoading, setError]
+        [storeConnected, publicKey, network, isWrongNetwork, showOverlay, setLoading, setError]
     );
 
-    // ── invokeContract() ─────────────────────────────────────────────────────
+    const signTxRef = useRef(signTx);
+    useEffect(() => {
+        signTxRef.current = signTx;
+    }, [signTx]);
 
     const invokeContract = useCallback(
         async ({ contractId, method, args = [] }: InvokeContractParams): Promise<string | null> => {
             if (!storeConnected || !publicKey) {
                 setError('Wallet not connected.');
+                return null;
+            }
+            if (isWrongNetwork) {
+                showOverlay('wrong-network', { currentNetwork: network });
                 return null;
             }
 
@@ -355,10 +455,8 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
                 setLoading(false);
             }
         },
-        [storeConnected, publicKey, network, networkConfig, signTx, setLoading, setError]
+        [storeConnected, publicKey, network, isWrongNetwork, networkConfig, signTx, showOverlay, setLoading, setError]
     );
-
-    // ── Context value ────────────────────────────────────────────────────────
 
     const value: StellarContextValue = {
         connect,
@@ -368,6 +466,8 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
         horizonUrl: networkConfig.horizonUrl,
         sorobanRpcUrl: networkConfig.sorobanRpcUrl,
         isFreighterInstalled,
+        expectedNetwork,
+        isWrongNetwork,
     };
 
     return (
@@ -377,16 +477,15 @@ export const StellarProvider: React.FC<{ children: React.ReactNode }> = ({
                 <WalletErrorOverlay
                     type={overlayState.type}
                     currentNetwork={overlayState.currentNetwork}
-                    expectedNetwork={EXPECTED_NETWORK}
+                    expectedNetwork={expectedNetwork}
                     message={overlayState.message}
                     onDismiss={dismissOverlay}
+                    onRetry={signRetry ?? undefined}
                 />
             )}
         </StellarContext.Provider>
     );
 };
-
-// ─── Custom Hook ──────────────────────────────────────────────────────────────
 
 export const useStellar = (): StellarContextValue => {
     const context = useContext(StellarContext);
@@ -394,4 +493,8 @@ export const useStellar = (): StellarContextValue => {
         throw new Error('useStellar must be used within a <StellarProvider>');
     }
     return context;
+};
+
+export const useOptionalStellar = (): StellarContextValue | null => {
+    return useContext(StellarContext);
 };

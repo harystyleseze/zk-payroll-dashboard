@@ -3,6 +3,10 @@ import { StellarProvider } from '@/components/providers/StellarProvider';
 import { StellarDebugPanel } from '@/components/debug/StellarDebugPanel';
 import { MonitoringProvider } from '@/components/providers/MonitoringProvider';
 import { Toaster } from "@/components/ui/sonner";
+import { HelpDrawer } from "@/components/ui/HelpDrawer";
+import { RetryToastCenter } from "@/components/features/network/RetryToastCenter";
+import { PauseStatusBanner } from "@/components/status/PauseStatusBanner";
+import { ContractErrorDrawer } from "@/components/features/errors/ContractErrorDrawer";
 import "./globals.css";
 export const metadata: Metadata = {
   title: "ZK Payroll Dashboard",
@@ -19,7 +23,11 @@ export default function RootLayout({
       <body>
         <StellarProvider>
           <MonitoringProvider />
+          <PauseStatusBanner />
           {children}
+          <HelpDrawer />
+          <RetryToastCenter />
+          <ContractErrorDrawer />
           {process.env.NODE_ENV === 'development' && <StellarDebugPanel />}
           <Toaster />
         </StellarProvider>
@@ -27,3 +35,4 @@ export default function RootLayout({
     </html>
   );
 }
+
